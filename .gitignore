@@ -1,0 +1,9 @@
+__pycache__/
+.env
+*.pyc
+.cache/
+.venv/
+.env.*
+/uploads/
+/work/
+artifacts/
