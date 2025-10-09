@@ -68,8 +68,6 @@ az containerapp up \
     --source . \
     --target-port 8002 \
     --ingress external \
-    --cpu 2.0 \
-    --memory 4.0Gi \
     --env-vars \
         "OPENAI_API_KEY=$OPENAI_API_KEY" \
         "STT_PROVIDER=local" \
@@ -82,6 +80,17 @@ az containerapp up \
         "PARSING_AGENT_URL=${PARSING_AGENT_URL}" \
         "STORAGE_DIR=/app/artifacts"
 
+log_info "Updating resource allocation (2.0 CPU, 4.0Gi memory)..."
+
+# Update resources separately (az containerapp up doesn't support --cpu/--memory)
+az containerapp update \
+    --name "$APP_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --cpu 2.0 \
+    --memory 4.0Gi \
+    --min-replicas 1 \
+    --max-replicas 5
+
 # Get the URL
 APP_URL=$(az containerapp show \
     --name "$APP_NAME" \
@@ -91,6 +100,7 @@ APP_URL=$(az containerapp show \
 log_info "Deployment complete!"
 log_info "App URL: https://$APP_URL"
 log_info "Health check: https://$APP_URL/health"
+log_info "Resources: 2.0 CPU, 4.0Gi memory"
 
 echo ""
 echo "Test the deployment with:"
