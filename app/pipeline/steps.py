@@ -4,6 +4,7 @@ import sys
 import shlex
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -11,6 +12,9 @@ from ..config import settings
 
 FFMPEG = settings.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = settings.ffprobe_path or shutil.which("ffprobe") or "ffprobe"
+
+# Initialize threading lock at module level to avoid race conditions
+_fw_model_lock = threading.Lock()
 
 # Run a subprocess in a background thread (Windows-friendly for asyncio)
 async def _run_proc(args: List[str]) -> tuple[int, bytes, bytes]:
@@ -165,56 +169,63 @@ async def transcribe_openai(file_path: str) -> Dict[str, Any]:
     return await _call()
 
 _fw_model = None
+_fw_model_lock = threading.Lock()
+
 def get_faster_whisper_model():
     global _fw_model
     if _fw_model is None:
-        try:
-            # Avoid Windows privilege issues with hardlinks/symlinks in HF cache
-            if not os.getenv("HF_HUB_DISABLE_SYMLINKS"):
-                os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
-            if not os.getenv("HF_HUB_DISABLE_HARD_LINKS"):
-                os.environ["HF_HUB_DISABLE_HARD_LINKS"] = "1"
-            # Route Hugging Face cache into our storage directory for clearer permissions
-            cache_dir = Path(settings.storage_dir) / "hf-cache"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            if not os.getenv("HUGGINGFACE_HUB_CACHE"):
-                os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir)
+        with _fw_model_lock:  # Lock ONLY for initialization
+            # Double-check pattern: another thread might have loaded it while we waited
+            if _fw_model is None:
+                try:
+                    # Avoid Windows privilege issues with hardlinks/symlinks in HF cache
+                    if not os.getenv("HF_HUB_DISABLE_SYMLINKS"):
+                        os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+                    if not os.getenv("HF_HUB_DISABLE_HARD_LINKS"):
+                        os.environ["HF_HUB_DISABLE_HARD_LINKS"] = "1"
+                    # Route Hugging Face cache into our storage directory for clearer permissions
+                    cache_dir = Path(settings.storage_dir) / "hf-cache"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    if not os.getenv("HUGGINGFACE_HUB_CACHE"):
+                        os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir)
 
-            from faster_whisper import WhisperModel
-            device = None if settings.stt_device == "auto" else settings.stt_device
-            try:
-                print("[TA] faster-whisper cache", {
-                    "HF_HOME": os.getenv("HF_HOME"),
-                    "HUGGINGFACE_HUB_CACHE": os.getenv("HUGGINGFACE_HUB_CACHE"),
-                    "HF_HUB_DISABLE_SYMLINKS": os.getenv("HF_HUB_DISABLE_SYMLINKS"),
-                    "HF_HUB_DISABLE_HARD_LINKS": os.getenv("HF_HUB_DISABLE_HARD_LINKS"),
-                    "download_root": str(cache_dir),
-                    "device": device or "auto",
-                    "model": settings.stt_model,
-                })
-            except Exception:
-                pass
-            # Map auto/invalids to library defaults
-            compute_type = settings.stt_compute_type
-            if not compute_type or compute_type == "auto":
-                compute_type = "default"
-            cpu_threads = settings.stt_cpu_threads if settings.stt_cpu_threads and settings.stt_cpu_threads > 0 else 0
+                    from faster_whisper import WhisperModel
+                    device = None if settings.stt_device == "auto" else settings.stt_device
+                    try:
+                        print("[TA] faster-whisper cache", {
+                            "HF_HOME": os.getenv("HF_HOME"),
+                            "HUGGINGFACE_HUB_CACHE": os.getenv("HUGGINGFACE_HUB_CACHE"),
+                            "HF_HUB_DISABLE_SYMLINKS": os.getenv("HF_HUB_DISABLE_SYMLINKS"),
+                            "HF_HUB_DISABLE_HARD_LINKS": os.getenv("HF_HUB_DISABLE_HARD_LINKS"),
+                            "download_root": str(cache_dir),
+                            "device": device or "auto",
+                            "model": settings.stt_model,
+                        })
+                    except Exception:
+                        pass
+                    # Map auto/invalids to library defaults
+                    compute_type = settings.stt_compute_type
+                    if not compute_type or compute_type == "auto":
+                        compute_type = "default"
+                    cpu_threads = settings.stt_cpu_threads if settings.stt_cpu_threads and settings.stt_cpu_threads > 0 else 0
 
-            _fw_model = WhisperModel(
-                settings.stt_model,
-                device=device or "auto",
-                compute_type=compute_type,
-                cpu_threads=cpu_threads,
-                num_workers=max(1, settings.stt_num_workers),
-                download_root=str(cache_dir),
-            )
-        except Exception as e:
-            raise RuntimeError(f"faster_whisper_unavailable: {e}")
+                    _fw_model = WhisperModel(
+                        settings.stt_model,
+                        device=device or "auto",
+                        compute_type=compute_type,
+                        cpu_threads=cpu_threads,
+                        num_workers=max(1, settings.stt_num_workers),
+                        download_root=str(cache_dir),
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"faster_whisper_unavailable: {e}")
     return _fw_model
 
 async def transcribe_faster_whisper(file_path: str, *, word_timestamps: Optional[bool] = None, beam_size: Optional[int] = None) -> Dict[str, Any]:
     """Return segments with word timestamps when available."""
     def _run():
+        # Get model instance (shared, but transcribe() call is thread-safe in faster-whisper >= 0.9.0)
+        # The tqdm issue is avoided by setting log_progress=False
         model = get_faster_whisper_model()
         wt = settings.stt_word_timestamps if word_timestamps is None else bool(word_timestamps)
         bs = max(1, settings.stt_beam_size if beam_size is None else int(beam_size))
@@ -227,6 +238,7 @@ async def transcribe_faster_whisper(file_path: str, *, word_timestamps: Optional
             "no_speech_threshold": getattr(settings, "stt_no_speech_threshold", 0.65),
             "compression_ratio_threshold": getattr(settings, "stt_compression_ratio_threshold", 2.6),
             "log_prob_threshold": getattr(settings, "stt_logprob_threshold", -1.0),
+            "log_progress": False,  # Disable tqdm progress bar to avoid threading conflicts
         }
         if settings.stt_language:
             kwargs["language"] = settings.stt_language
@@ -254,7 +266,9 @@ async def transcribe_faster_whisper(file_path: str, *, word_timestamps: Optional
         except Exception:
             pass
         return {"language": info.language, "segments": out}
-    # Run in thread to avoid blocking loop
+    
+    # Run in thread pool WITHOUT lock - faster-whisper model.transcribe() is thread-safe
+    # The log_progress=False prevents tqdm threading issues
     return await asyncio.to_thread(_run)
 
 async def refine_word_timestamps_by_cut(

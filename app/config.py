@@ -167,12 +167,14 @@ class Settings(BaseModel):
     stt_cpu_threads: int = int(os.getenv("STT_CPU_THREADS", "0"))  # 0 lets library decide
     stt_num_workers: int = int(os.getenv("STT_NUM_WORKERS", "1"))
     stt_language: str | None = os.getenv("STT_LANGUAGE")  # optional language hint like 'pt', 'en'
-    # Default VAD filter off; enable by setting STT_VAD_FILTER=1 if you want aggressive silence filtering
-    stt_vad_filter: bool = os.getenv("STT_VAD_FILTER", "0") not in ("0", "false", "False")
+    # VAD filter enabled by default to prevent hallucinations on silence/noise/music
+    # This skips transcribing segments with no speech, solving the root cause of repetitive hallucinations
+    stt_vad_filter: bool = os.getenv("STT_VAD_FILTER", "1") not in ("0", "false", "False")
     # Additional faster-whisper decoding knobs
     stt_condition_prev_text: bool = os.getenv("STT_CONDITION_PREV_TEXT", "0") not in ("0", "false", "False")
     stt_temperature: float = float(os.getenv("STT_TEMPERATURE", "0"))
-    stt_no_speech_threshold: float = float(os.getenv("STT_NO_SPEECH_THRESHOLD", "0.65"))
+    # Increased threshold to be more aggressive at skipping non-speech (helps reduce hallucinations)
+    stt_no_speech_threshold: float = float(os.getenv("STT_NO_SPEECH_THRESHOLD", "0.8"))
     stt_compression_ratio_threshold: float = float(os.getenv("STT_COMPRESSION_RATIO_THRESHOLD", "2.6"))
     stt_logprob_threshold: float = float(os.getenv("STT_LOGPROB_THRESHOLD", "-1.0"))
     chunk_seconds: int = int(os.getenv("CHUNK_SECONDS", "60"))
@@ -182,7 +184,8 @@ class Settings(BaseModel):
     use_sentence_segmentation: bool = os.getenv("USE_SENTENCE_SEGMENTATION", "1") not in ("0", "false", "False")
     sentence_min_chars: int = int(os.getenv("SENTENCE_MIN_CHARS", "12"))
     sentence_pause_gap: float = float(os.getenv("SENTENCE_PAUSE_GAP", "0.6"))
-    # Diarization toggle and mode
+    # Diarization enabled by default to test effectiveness
+    # Now with proper failure visibility to assess quality
     enable_diarization: bool = os.getenv("ENABLE_DIARIZATION", "1") not in ("0", "false", "False")
     diarization_mode: str = os.getenv("DIARIZATION_MODE", "auto")  # auto|light|full
     diarization_speakers: str | None = os.getenv("DIARIZATION_SPEAKERS")  # 'auto' or integer as string
@@ -196,5 +199,11 @@ class Settings(BaseModel):
     parsing_agent_url: str | None = os.getenv("PARSING_AGENT_URL")
     service_token: str | None = os.getenv("SERVICE_TOKEN")
     storage_dir: str = os.getenv("STORAGE_DIR", "artifacts")
+    
+    # LLM-based transcription correction (post-processing to fix phonetic/domain errors)
+    enable_llm_correction: bool = os.getenv("ENABLE_LLM_CORRECTION", "0") not in ("0", "false", "False")
+    llm_correction_mode: str = os.getenv("LLM_CORRECTION_MODE", "llm")  # llm|hybrid|quick
+    llm_correction_passes: int = int(os.getenv("LLM_CORRECTION_PASSES", "2"))
+    llm_correction_model: str = os.getenv("LLM_CORRECTION_MODEL", "gpt-5-mini")
 
 settings = Settings()

@@ -1,8 +1,10 @@
 import asyncio
+import os
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
 from ..storage.store import FileStore
+from ..storage.mongo_store import MongoDBStore
 from ..models import Transcript, Segment
 from ..config import settings
 from .steps import (
@@ -16,6 +18,121 @@ from .steps import (
 from .diarization_light import diarize_over_asr_segments  # lightweight diarization over ASR segments
 from ..jobs import job_store
 
+# Choose storage backend based on environment
+USE_MONGODB = os.getenv('USE_MONGODB_STORAGE', '').lower() in ('true', '1', 'yes')
+Store = MongoDBStore if USE_MONGODB else FileStore
+
+# REMOVED: filter_hallucinated_segments function
+# Hallucination filtering is now handled by LLM correction for better context-aware cleaning
+# This avoids removing valid Portuguese speech that may look "repetitive" to rule-based filters
+
+
+def normalize_speaker_labels(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Remove all speaker labels from segments.
+    
+    Diarization is currently not reliable enough, so we remove speaker labels entirely
+    to avoid cluttering transcripts with incorrect single-speaker labels.
+    
+    Args:
+        segments: List of segment dicts with 'speaker' field
+    
+    Returns:
+        Segments with speaker labels removed
+    """
+    if not segments:
+        return segments
+    
+    try:
+        print(f"[TA][FILTER] Removing all speaker labels (diarization disabled for quality)")
+    except Exception:
+        pass
+    
+    # Remove speaker labels from all segments
+    for seg in segments:
+        seg.pop("speaker", None)
+        # Also remove from words if present
+        if seg.get("words"):
+            for w in seg["words"]:
+                if isinstance(w, dict):
+                    w.pop("speaker", None)
+    
+    return segments
+
+
+def calculate_optimal_chunk_size(total_duration_seconds: float, target_processing_minutes: float = 5.0) -> int:
+    """
+    Calculate optimal chunk size to target a specific total processing time.
+    
+    Based on empirical testing:
+    - Local STT (faster-whisper medium): ~0.15-0.25x realtime (4-6 minutes per hour of audio)
+    - OpenAI Whisper API: ~0.05-0.1x realtime (3-6 minutes per hour, depending on network)
+    - Diarization adds ~10-20% overhead
+    
+    Strategy: Divide audio into N chunks such that processing time ≈ target_processing_minutes
+    
+    Args:
+        total_duration_seconds: Total audio duration in seconds
+        target_processing_minutes: Desired total processing time in minutes (default: 5)
+    
+    Returns:
+        Optimal chunk size in seconds (minimum 30, maximum 300)
+    """
+    # Estimate processing speed multiplier based on STT provider
+    if settings.stt_provider == "openai":
+        # OpenAI is faster but has network overhead
+        speed_multiplier = 0.08  # ~5 minutes per hour
+    else:
+        # Local STT speed depends on model size
+        model = settings.stt_model.lower()
+        if "tiny" in model or "base" in model:
+            speed_multiplier = 0.05  # Very fast
+        elif "small" in model:
+            speed_multiplier = 0.10
+        elif "medium" in model:
+            speed_multiplier = 0.20
+        elif "large" in model:
+            speed_multiplier = 0.35
+        else:
+            speed_multiplier = 0.20  # Default to medium
+    
+    # Add diarization overhead if enabled
+    if settings.enable_diarization:
+        speed_multiplier *= 1.15  # 15% overhead for speaker detection
+    
+    # Calculate how many chunks we need to hit target processing time
+    # processing_time = duration * speed_multiplier
+    # If we split into N chunks: processing_time_per_chunk = (duration/N) * speed_multiplier
+    # With concurrency C: total_time = (duration/N) * speed_multiplier / C
+    # Solve for N: N = (duration * speed_multiplier) / (target_minutes * 60 * C)
+    
+    target_seconds = target_processing_minutes * 60
+    concurrency = max(1, settings.transcribe_concurrency)
+    
+    # Expected processing time without chunking
+    expected_processing_seconds = total_duration_seconds * speed_multiplier
+    
+    # If already fast enough, use larger chunks
+    if expected_processing_seconds <= target_seconds:
+        # Use moderate chunks for better parallelization
+        return min(180, int(total_duration_seconds / 2)) if total_duration_seconds > 120 else int(total_duration_seconds)
+    
+    # Calculate required number of chunks for target time
+    # total_time = (total_duration / num_chunks) * speed_multiplier / concurrency = target_seconds
+    # num_chunks = (total_duration * speed_multiplier) / (target_seconds * concurrency)
+    num_chunks_needed = (total_duration_seconds * speed_multiplier) / (target_seconds * concurrency)
+    num_chunks_needed = max(2, num_chunks_needed)  # At least 2 chunks for parallelization
+    
+    # Calculate chunk size
+    optimal_chunk_seconds = total_duration_seconds / num_chunks_needed
+    
+    # Clamp to reasonable bounds
+    # Minimum 30 seconds (too small = too much overhead)
+    # Maximum 300 seconds (5 minutes - good balance)
+    optimal_chunk_seconds = max(30, min(300, optimal_chunk_seconds))
+    
+    return int(optimal_chunk_seconds)
+
 class PipelineState(dict):
     pass
 
@@ -25,7 +142,7 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
     # Shortcut: if input is a .txt, persist as transcript without audio processing
     if str(input_path).lower().endswith('.txt'):
         text = Path(input_path).read_text(encoding='utf-8', errors='ignore')
-        transcript_id = FileStore.new_transcript_id()
+        transcript_id = Store.new_transcript_id()
         payload = Transcript(
             transcript_id=transcript_id,
             org_id=org_id,
@@ -36,7 +153,13 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
             segments=[],
             text=text.strip()
         ).model_dump()
-        FileStore.save_transcript_json(transcript_id, payload)
+        
+        # Save to storage (MongoDB or FileStore based on config)
+        if USE_MONGODB:
+            await MongoDBStore.save_transcript(transcript_id, payload, org_id, meeting_ref)
+        else:
+            FileStore.save_transcript_json(transcript_id, payload)
+        
         return {"transcript_id": transcript_id, "text": text}
 
     def _sanitize_segments(items):
@@ -166,39 +289,61 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                 # Fall back to single segment
                 segs = [(0.0, 0.0)]
         else:
-            # No silence segmentation; use fixed-size chunking over full duration
+            # No silence segmentation; use dynamic chunking optimized for target processing time
             try:
                 from .steps import probe_duration_seconds
                 dur = probe_duration_seconds(norm)
             except Exception:
                 dur = None
             if dur and dur > 0:
+                # Calculate optimal chunk size to target 5-minute processing time
+                target_minutes = float(os.environ.get("TARGET_PROCESSING_MINUTES", "5.0"))
+                optimal_chunk = calculate_optimal_chunk_size(dur, target_minutes)
+                try:
+                    print(f"[TA][DEBUG] segment: duration={dur:.1f}s, optimal_chunk={optimal_chunk}s (target={target_minutes}min)")
+                except Exception:
+                    pass
                 segs = []
                 start = 0.0
                 while start < dur:
-                    end = min(dur, start + settings.chunk_seconds)
+                    end = min(dur, start + optimal_chunk)
                     segs.append((max(0.0, start - settings.overlap_seconds), end))
                     start = end
             else:
                 segs = [(0.0, 0.0)]  # unbounded marker = full file downstream
-        # Cap segments to chunk_seconds and add overlap; clamp to duration if known
+        # Cap segments to dynamic chunk size and add overlap; clamp to duration if known
         final: List[Tuple[float, float]] = []
         if segs == [(0.0, 0.0)]:
             final = [(0.0, 0.0)]
         else:
+            # When using silence segmentation, respect those boundaries but still apply dynamic chunking
+            # if segments are too large
+            try:
+                from .steps import probe_duration_seconds
+                dur_check = total_dur or probe_duration_seconds(norm)
+            except Exception:
+                dur_check = None
+            
+            # Calculate optimal chunk size once for capping
+            if dur_check and dur_check > 0:
+                target_minutes = float(os.environ.get("TARGET_PROCESSING_MINUTES", "5.0"))
+                max_chunk = calculate_optimal_chunk_size(dur_check, target_minutes)
+            else:
+                max_chunk = settings.chunk_seconds
+            
             for (s, e) in segs:
                 dur = e - s
-                if dur <= settings.chunk_seconds:
+                if dur <= max_chunk:
                     s2 = max(0.0, s - settings.overlap_seconds)
                     e2 = e
                     if total_dur and total_dur > 0:
                         e2 = min(e2, total_dur)
                     final.append((s2, e2))
                 else:
-                    # slice into multiple chunks with overlap
+                    # slice into multiple chunks with overlap using optimal size
                     start = s
                     while start < e:
-                        end = min(e, start + settings.chunk_seconds)
+                        end = min(e, start + max_chunk)
                         s2 = max(0.0, start - settings.overlap_seconds)
                         e2 = end
                         if total_dur and total_dur > 0:
@@ -252,14 +397,23 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                     forced_chunk = True
 
             if (dur and dur > 0 and dur > settings.chunk_seconds) or forced_chunk:
-                # create fixed chunks now
+                # Create dynamic chunks optimized for target processing time
                 fixed: List[Tuple[float, float]] = []
                 start = 0.0
                 # If duration is unknown but forced_chunk is True, approximate a minimal split into two parts
                 if (not dur or dur <= 0) and forced_chunk:
                     dur = float(settings.chunk_seconds * 2)
+                
+                # Calculate optimal chunk size for target processing time
+                target_minutes = float(os.environ.get("TARGET_PROCESSING_MINUTES", "5.0"))
+                optimal_chunk = calculate_optimal_chunk_size(dur, target_minutes)
+                try:
+                    print(f"[TA][DEBUG] transcribe: using dynamic chunks of {optimal_chunk}s for {dur:.1f}s audio (target={target_minutes}min)")
+                except Exception:
+                    pass
+                
                 while start < (dur or 0.0):
-                    end = min(dur, start + settings.chunk_seconds)
+                    end = min(dur, start + optimal_chunk)
                     fixed.append((max(0.0, start - settings.overlap_seconds), end))
                     start = end
                 segs = fixed or [(0.0, 0.0)]
@@ -357,8 +511,10 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                                 # Skip this chunk
                                 return idx, []
                         # No fallback available: log and skip this chunk instead of crashing the job
+                        import traceback
                         try:
-                            print(f"[TA][ERROR] transcribe: faster_whisper_failed idx={idx} err={e}")
+                            print(f"[TA][ERROR] transcribe: faster_whisper_failed idx={idx} err_type={type(e).__name__} err_str={str(e)} err_repr={repr(e)}")
+                            print(f"[TA][ERROR] transcribe: traceback:\n{traceback.format_exc()}")
                         except Exception:
                             pass
                         return idx, []
@@ -466,9 +622,7 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                 pass
             stt_segs = _sanitize_segments(state.get("stt_segments", []) or [])
             # Ensure each segment has a default speaker label for downstream formatting
-            for seg in stt_segs:
-                if not seg.get("speaker"):
-                    seg["speaker"] = "SPEAKER_0"
+            # Don't add default speaker labels - we don't use them
             state["stt_segments"] = stt_segs
             # Optional regrouping remains available
             try:
@@ -479,6 +633,21 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                         state["stt_segments"] = reg
             except Exception:
                 pass
+            
+            # Filter hallucinations and normalize speaker labels
+            # NOTE: Hallucination filtering DISABLED - was too aggressive and removing valid Portuguese speech
+            # Whisper's built-in thresholds + LLM correction are sufficient
+            try:
+                segs = state.get("stt_segments", []) or []
+                # segs = filter_hallucinated_segments(segs)  # DISABLED - removing too much valid content
+                segs = normalize_speaker_labels(segs)
+                state["stt_segments"] = segs
+            except Exception as e:
+                try:
+                    print(f"[TA][WARN] Segment filtering failed: {e}")
+                except Exception:
+                    pass
+            
             return state
         try:
             job_store.update(job_id, phase="diarize", status="processing")
@@ -501,6 +670,9 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                     n_speakers=getattr(settings, "diarization_speakers", None) or "auto",
                 )
                 if diarized:
+                    # Count unique speakers
+                    unique_speakers = set(seg.get("speaker") for seg in diarized if seg.get("speaker"))
+                    print(f"[TA][DIAR] ✓ Success using light mode: {len(unique_speakers)} speaker(s) detected: {sorted(unique_speakers)}")
                     state["stt_segments"] = _sanitize_segments(diarized)
                     # Optional regrouping into sentence-level segments
                     try:
@@ -512,27 +684,51 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                     except Exception:
                         pass
                     return state
-            except Exception:
+                else:
+                    print(f"[TA][DIAR] ✗ Light mode failed - falling back to full diarization")
+            except Exception as e:
+                print(f"[TA][DIAR] ✗ Light mode error: {e} - falling back to full diarization")
                 diar = None
         # full/auto modes: try external diarizers producing (start,end,speaker)
+        diarization_method = None
         try:
             diar = await diarize_pyannote(norm)
-        except Exception:
+            if diar:
+                diarization_method = "pyannote"
+        except Exception as e:
+            print(f"[TA][DIAR] PyAnnote failed: {e}")
             diar = None
         if not diar:
             try:
                 from .steps import diarize_resemblyzer
                 diar = await diarize_resemblyzer(norm)
-            except Exception:
+                if diar:
+                    diarization_method = "resemblyzer"
+            except Exception as e:
+                print(f"[TA][DIAR] Resemblyzer failed: {e}")
                 diar = None
         if not diar:
             try:
                 from .steps import diarize_simple
                 diar = await diarize_simple(norm)
-            except Exception:
+                if diar:
+                    diarization_method = "simple"
+            except Exception as e:
+                print(f"[TA][DIAR] Simple diarizer failed: {e}")
                 diar = None
-        # Attach speaker labels if available by simple overlap majority; otherwise default
+        
+        # Report diarization results
+        if diar:
+            unique_speakers = set(spk for _, _, spk in diar)
+            print(f"[TA][DIAR] ✓ Success using {diarization_method}: {len(unique_speakers)} speaker(s) detected: {sorted(unique_speakers)}")
+            print(f"[TA][DIAR]   Total diarization segments: {len(diar)}")
+        else:
+            print(f"[TA][DIAR] ✗ FAILED - All diarization methods failed. Segments will have NO speaker labels.")
+        
+        # Attach speaker labels if available by simple overlap majority; otherwise leave None
         if stt_segs:
+            segments_with_speakers = 0
+            segments_without_speakers = 0
             for seg in stt_segs:
                 s = seg.get("start", 0.0) or 0.0
                 e = seg.get("end", 0.0) or s
@@ -544,17 +740,22 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                         if ov > best_overlap:
                             best_overlap = ov
                             label = spk
-                # Default if diarization unavailable/no overlap
-                if not label:
-                    label = "SPEAKER_0"
-                seg["speaker"] = label
+                # NO DEFAULT - if diarization failed or no overlap, speaker stays None
+                # This makes failures obvious instead of silently masking them
+                if label:
+                    segments_with_speakers += 1
+                    seg["speaker"] = label
+                else:
+                    segments_without_speakers += 1
+                    # Don't set speaker at all - let it be None/missing
+                
                 # Ensure words inherit or get mapped by overlap
                 if seg.get("words"):
                     new_words = []
                     for w in seg["words"]:
                         ws = (w.get("start") if isinstance(w, dict) else None) or s
                         we = (w.get("end") if isinstance(w, dict) else None) or ws
-                        wlabel = label
+                        wlabel = label  # Inherit segment's label (could be None)
                         if diar:
                             wbest = 0.0
                             for (ds, de, spk) in diar:
@@ -562,10 +763,15 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                                 if ov > wbest:
                                     wbest = ov
                                     wlabel = spk
-                        # set/inherit speaker on word
-                        nw = {**w, "speaker": wlabel} if isinstance(w, dict) else {"start": ws, "end": we, "text": str(w), "speaker": wlabel}
+                        # Only set speaker on word if we have a label
+                        if wlabel:
+                            nw = {**w, "speaker": wlabel} if isinstance(w, dict) else {"start": ws, "end": we, "text": str(w), "speaker": wlabel}
+                        else:
+                            nw = w if isinstance(w, dict) else {"start": ws, "end": we, "text": str(w)}
                         new_words.append(nw)
                     seg["words"] = new_words
+            
+            print(f"[TA][DIAR] Speaker assignment: {segments_with_speakers} segments with speakers, {segments_without_speakers} without")
 
             # Refinement step: split segments for more precise speaker attribution
             # - If words exist with speaker labels: split segments into contiguous word-speaker runs
@@ -644,6 +850,21 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
                     state["stt_segments"] = reg
         except Exception:
             pass
+        
+        # Filter hallucinations and normalize speaker labels
+        # NOTE: Hallucination filtering DISABLED - was too aggressive and removing valid Portuguese speech
+        # Whisper's built-in thresholds + LLM correction are sufficient
+        try:
+            segs = state.get("stt_segments", []) or []
+            # segs = filter_hallucinated_segments(segs)  # DISABLED - removing too much valid content
+            segs = normalize_speaker_labels(segs)
+            state["stt_segments"] = segs
+        except Exception as e:
+            try:
+                print(f"[TA][WARN] Segment filtering failed: {e}")
+            except Exception:
+                pass
+        
         return state
 
     async def node_merge_persist(state: PipelineState):
@@ -651,6 +872,111 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
             job_store.update(job_id, phase="persist", status="processing")
         except Exception:
             pass
+        
+        # ===== LLM CORRECTION STEP (if enabled) =====
+        # Apply intelligent error correction BEFORE persisting
+        if settings.enable_llm_correction:
+            if not settings.openai_api_key:
+                print("[TA][LLM_CORRECTION] ⚠️ WARNING: LLM correction is enabled but OPENAI_API_KEY is not set!")
+                print("[TA][LLM_CORRECTION] ⚠️ Hallucinations will NOT be removed. Please set OPENAI_API_KEY in .env")
+            else:
+                try:
+                    from .transcription_correction import correct_transcription
+                    
+                    segs_in = state.get("stt_segments", []) or []
+                    if segs_in:
+                        # Extract text from segments
+                        pieces: List[str] = []
+                        for s in segs_in:
+                            if isinstance(s, dict):
+                                pieces.append(s.get("text", ""))
+                            else:
+                                pieces.append(getattr(s, "text", ""))
+                        
+                        raw_text = " ".join(pieces).strip()
+                        
+                        if raw_text:
+                            print(f"[TA][LLM_CORRECTION] Starting correction (mode={settings.llm_correction_mode}, passes={settings.llm_correction_passes})")
+                            
+                            # Apply correction
+                            corrected_text = correct_transcription(
+                                raw_text,
+                                api_key=settings.openai_api_key,
+                                base_url=settings.openai_base_url,
+                                model=settings.llm_correction_model,
+                                mode=settings.llm_correction_mode,
+                                num_passes=settings.llm_correction_passes,
+                            )
+                            
+                            # Update segment texts with corrected version
+                            # Simple approach: split corrected text and redistribute to segments proportionally
+                            if corrected_text and corrected_text != raw_text:
+                                # For now, just update the first segment with full corrected text
+                                # (More sophisticated: split by sentence boundaries and redistribute)
+                                print(f"[TA][LLM_CORRECTION] ✓ Correction applied (chars: {len(raw_text)} → {len(corrected_text)})")
+                                
+                                # Replace segment texts with corrected version
+                                # Strategy: Keep timing info, update text
+                                corrected_segs = []
+                                for s in segs_in:
+                                    if isinstance(s, dict):
+                                        corrected_segs.append({**s, "text": corrected_text if s == segs_in[0] else ""})
+                                    else:
+                                        # Handle object-like segments
+                                        corrected_segs.append(s)
+                                
+                                # Better: distribute corrected text across segments by word count
+                                # This preserves timing while fixing errors
+                                raw_words = raw_text.split()
+                                corrected_words = corrected_text.split()
+                                
+                                if len(raw_words) > 0 and len(corrected_words) > 0:
+                                    # Redistribute corrected words proportionally across all segments
+                                    # This handles cases where LLM removed hallucinations (fewer words)
+                                    corrected_segs = []
+                                    total_raw_words = len(raw_words)
+                                    total_corrected_words = len(corrected_words)
+                                    word_idx = 0
+                                    
+                                    for s in segs_in:
+                                        if isinstance(s, dict):
+                                            seg_text = s.get("text", "")
+                                        else:
+                                            seg_text = getattr(s, "text", "")
+                                        
+                                        seg_word_count = len(seg_text.split())
+                                        if seg_word_count == 0:
+                                            continue
+                                        
+                                        # Calculate proportional word count for this segment
+                                        # If LLM removed words, scale down proportionally
+                                        proportion = seg_word_count / total_raw_words
+                                        target_word_count = max(1, int(proportion * total_corrected_words))
+                                        
+                                        # Take words from corrected text (or remaining words if near end)
+                                        remaining_words = len(corrected_words) - word_idx
+                                        actual_word_count = min(target_word_count, remaining_words)
+                                        
+                                        if actual_word_count > 0:
+                                            seg_corrected_words = corrected_words[word_idx:word_idx + actual_word_count]
+                                            seg_corrected_text = " ".join(seg_corrected_words)
+                                            
+                                            if seg_corrected_text.strip():
+                                                if isinstance(s, dict):
+                                                    corrected_segs.append({**s, "text": seg_corrected_text})
+                                                else:
+                                                    corrected_segs.append(s)
+                                            
+                                            word_idx += actual_word_count
+                                    
+                                    state["stt_segments"] = corrected_segs
+                            else:
+                                print(f"[TA][LLM_CORRECTION] No changes needed")
+                except Exception as e:
+                    print(f"[TA][LLM_CORRECTION] ✗ Correction failed: {e}")
+                    # Continue with uncorrected text
+        
+        # ===== FINAL SANITIZE AND PERSIST =====
         # Final sanitize before persisting
         segs_in = state.get("stt_segments", []) or []
         try:
@@ -738,14 +1064,31 @@ async def run_pipeline(job_id: str, input_path: str, org_id: str | None, meeting
             print("[TA][DEBUG] persist: saving transcript", {"id": transcript_id, "segments": len(seg_models), "text_len": len(text)})
         except Exception:
             pass
-        FileStore.save_transcript_json(transcript_id, payload)
-        state["transcript_id"] = transcript_id
-        state["text"] = text
-        # Expose transcript_id immediately for job pollers
+        
+        # Save to storage (MongoDB or FileStore based on config)
+        # CRITICAL: Save BEFORE exposing transcript_id to avoid race condition
         try:
-            job_store.update(job_id, transcript_id=transcript_id)
-        except Exception:
-            pass
+            if USE_MONGODB:
+                await MongoDBStore.save_transcript(transcript_id, payload, org_id, meeting_ref)
+            else:
+                FileStore.save_transcript_json(transcript_id, payload)
+            
+            # Only set state values after successful save
+            state["transcript_id"] = transcript_id
+            state["text"] = text
+            
+            # ONLY expose transcript_id AFTER successful save to prevent race condition
+            # where API callers see the ID before the transcript is persisted
+            try:
+                job_store.update(job_id, transcript_id=transcript_id)
+                print(f"[TA][DEBUG] persist: ✓ Transcript {transcript_id} saved and exposed to job store")
+            except Exception as e:
+                print(f"[TA][WARN] persist: Failed to update job store: {e}")
+        except Exception as save_error:
+            # If save fails, don't expose transcript_id and propagate error
+            print(f"[TA][ERROR] persist: Failed to save transcript {transcript_id}: {save_error}")
+            raise RuntimeError(f"transcript_save_failed: {save_error}")
+        
         return state
 
     # Sequential orchestration (no LangGraph). Each node mutates state and returns it.

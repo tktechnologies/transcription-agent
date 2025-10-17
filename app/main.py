@@ -85,14 +85,16 @@ async def upload(
         try:
             job_store.update(job.job_id, phase="transcribe")
             result = await run_pipeline(job.job_id, input_path, org_id, meeting_ref, mode, profile)
-            # Preserve existing transcript_id if present (persist step may have already set it)
-            current = job_store.get(job.job_id)
-            existing_tid = getattr(current, "transcript_id", None) if current else None
+            # Extract transcript_id from pipeline result
+            # The pipeline returns transcript_id only after successful DB save
             tid = None
             try:
-                tid = (result.get("transcript_id") if isinstance(result, dict) else None) or existing_tid
+                tid = result.get("transcript_id") if isinstance(result, dict) else None
             except Exception:
-                tid = existing_tid
+                pass
+            
+            # Mark job as done with the transcript_id
+            # This update happens AFTER the transcript is saved in the pipeline
             job_store.update(job.job_id, status="done", transcript_id=tid)
             try:
                 print("[TA] Job done", {"job_id": job.job_id, "transcript_id": tid})
@@ -115,7 +117,7 @@ async def get_job(req: Request, job_id: str):
     if not j:
         raise HTTPException(status_code=404, detail="not_found")
     try:
-        print("[TA] Job status", {"job_id": job_id, "status": j.status, "phase": j.phase, "error": j.error})
+        print("[TA] Job status", {"job_id": job_id, "status": j.status, "phase": j.phase, "progress": j.progress, "error": j.error})
     except Exception:
         pass
     return j
